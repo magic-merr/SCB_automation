@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""
+CAISO Daily Fuel Mix Report — fully automated, no Excel required.
+
+Pipeline:
+  1. Download yesterday's fuelsource.csv from CAISO (same download logic /
+     proxy handling as the original automation2.2.py).
+  2. Compute start-of-day / end-of-day / daily-average / net-change stats
+     per fuel type with pandas.
+  3. Render a single-page portrait dashboard (3 pies, 2 bar charts, 1 line
+     chart, all data-labeled) with matplotlib.
+  4. Save the dashboard as a PDF (and a PNG) to the OneDrive-synced folder.
+
+Power Automate's only remaining job: watch ONE_DRIVE_PATH for the constant
+filename below and email it — no chart-building in Power Automate at all.
+
+Placeholders to change are marked ">>> CHANGE_ME <<<".
+"""
+
+import os
+import sys
+import time
+import logging
+from datetime import datetime, timedelta
+
+import requests
+import subprocess
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.gridspec import GridSpec
+
+# -----------------------
+# CONFIG — >>> CHANGE_ME <<<
+# -----------------------
+ONE_DRIVE_PATH = r"C:\Users\8234545\OneDrive - Standard Chartered Bank\automation\CAISO_data_dumps"  # >>> CHANGE_ME
+ARCHIVE_DIR = "archive"
+
+CSV_FILENAME_TEMPLATE = "fuelsource_{datekey}.csv"
+CSV_CONSTANT_FILENAME = "fuelsource.csv"
+PDF_CONSTANT_FILENAME = "CAISO_Daily_Dashboard.pdf"          # >>> what Power Automate watches for / emails
+PDF_DATED_TEMPLATE = "CAISO_Daily_Dashboard_{datekey}.pdf"
+PNG_CONSTANT_FILENAME = "CAISO_Daily_Dashboard.png"           # optional, e.g. to embed inline in an email body
+
+RETRIES = 3
+RETRY_DELAY = 5  # seconds, multiplied by attempt number
+TIMEZONE = "America/New_York"  # >>> CHANGE_ME only if you want a different TZ
+
+LOGFILE_NAME = "caiso_daily_report.log"
+
+CATEGORIES = ["Solar", "Wind", "Geothermal", "Biomass", "Biogas", "Small hydro",
+              "Coal", "Nuclear", "Natural Gas", "Large Hydro", "Batteries",
+              "Imports", "Other"]
+
+# Distinct, print-friendly colors, one per category (same order as CATEGORIES)
+COLORS = ["#F2C314", "#4C9F70", "#8B5E3C", "#6FA8A0", "#B08BBB", "#5B8DEF",
+          "#2B2B2B", "#8B2E2E", "#7CA82B", "#2E6F9E", "#9B59B6", "#5A3E36", "#B0B0B0"]
+
+os.makedirs(ONE_DRIVE_PATH, exist_ok=True)
+os.makedirs(os.path.join(ONE_DRIVE_PATH, ARCHIVE_DIR), exist_ok=True)
+logging.basicConfig(
+    filename=os.path.join(ONE_DRIVE_PATH, LOGFILE_NAME),
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
+# =========================================================
+# --- Download (unchanged logic from automation2.2.py) ---
+# =========================================================
+
+def get_zoneinfo(tz_name: str):
+    if ZoneInfo:
+        try:
+            return ZoneInfo(tz_name)
+        except Exception:
+            logging.exception("ZoneInfo failed for %s", tz_name)
+            try:
+                from dateutil import tz as dateutil_tz
+                t = dateutil_tz.gettz(tz_name)
+                if t:
+                    return t
+            except Exception:
+                pass
+            return None
+    return None
+
+
+def get_ie_proxy_from_registry():
+    try:
+        import winreg
+    except Exception:
+        return None
+    try:
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            try:
+                proxy_enable, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            except FileNotFoundError:
+                return None
+            if not proxy_enable:
+                return None
+            proxy_server, _ = winreg.QueryValueEx(key, "ProxyServer")
+            if not proxy_server:
+                return None
+            proxy = proxy_server.split(";")[0]
+            if "=" in proxy:
+                parts = dict(p.split("=") for p in proxy_server.split(";") if "=" in p)
+                proxy = parts.get("https") or parts.get("http") or list(parts.values())[0]
+            if not proxy.startswith(("http://", "https://")):
+                proxy = "http://" + proxy
+            return {"http": proxy, "https": proxy}
+    except Exception:
+        logging.exception("Failed to read IE proxy from registry")
+        return None
+
+
+PROXIES = get_ie_proxy_from_registry()
+if PROXIES:
+    os.environ.setdefault("HTTP_PROXY", PROXIES["http"])
+    os.environ.setdefault("HTTPS_PROXY", PROXIES["https"])
+    logging.info("Set HTTP(S)_PROXY from IE settings: %s", PROXIES.get("https"))
+
+
+def yesterday_datekey() -> str:
+    tz = get_zoneinfo(TIMEZONE)
+    now_et = datetime.now(tz) if tz else datetime.now()
+    y = now_et.date() - timedelta(days=1)
+    return y.strftime("%Y%m%d")
+
+
+def download(url: str):
+    for attempt in range(1, RETRIES + 1):
+        try:
+            resp = requests.get(url, timeout=30)
+            if resp.status_code == 200 and resp.content:
+                return resp.content
+            logging.warning("Attempt %d: HTTP %s for %s", attempt, resp.status_code, url)
+        except Exception:
+            logging.exception("Attempt %d exception while downloading %s", attempt, url)
+        time.sleep(RETRY_DELAY * attempt)
+    return None
+
+
+def powershell_download_to_bytes(url: str, target_dir: str, datekey: str):
+    tmp = os.path.join(target_dir, f"pw_{datekey}.tmp")
+    ps_command = (
+        "try { Invoke-WebRequest -Uri '" + url + "' -OutFile '" + tmp + "' -UseBasicParsing; exit 0 } "
+        "catch { exit 2 }"
+    )
+    cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_command]
+    for attempt in range(1, RETRIES + 1):
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if proc.returncode == 0 and os.path.exists(tmp):
+                with open(tmp, "rb") as f:
+                    data = f.read()
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                return data
+            logging.warning("PowerShell attempt %d failed rc=%s stderr=%s", attempt, proc.returncode, proc.stderr.strip())
+        except FileNotFoundError:
+            logging.exception("PowerShell not found on PATH")
+            break
+        except Exception:
+            logging.exception("PowerShell attempt %d raised", attempt)
+        time.sleep(RETRY_DELAY * attempt)
+    return None
+
+
+def atomic_write(path: str, content: bytes):
+    temp_path = path + ".tmp"
+    with open(temp_path, "wb") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp_path, path)
+
+
+def download_csv(datekey: str) -> str:
+    """Downloads fuelsource.csv for datekey, saves constant/dated/archive copies,
+    returns the path to the constant CSV."""
+    url = f"https://www.caiso.com/outlook/history/{datekey}/fuelsource.csv"
+    logging.info("Starting download for %s -> %s", datekey, url)
+
+    content = download(url)
+    if not content:
+        logging.error("requests download failed, trying PowerShell fallback...")
+        try:
+            content = powershell_download_to_bytes(url, ONE_DRIVE_PATH, datekey)
+        except Exception:
+            logging.exception("PowerShell fallback raised an exception")
+
+    if not content:
+        marker_path = os.path.join(ONE_DRIVE_PATH, f"download_failed_{datekey}.txt")
+        with open(marker_path, "w", encoding="utf-8") as f:
+            f.write(f"download failed for {datekey}\n")
+        raise RuntimeError(f"Failed to download {url} after {RETRIES} attempts")
+
+    fname = CSV_FILENAME_TEMPLATE.format(datekey=datekey)
+    target = os.path.join(ONE_DRIVE_PATH, fname)
+    archive_target = os.path.join(ONE_DRIVE_PATH, ARCHIVE_DIR, fname)
+    constant_target = os.path.join(ONE_DRIVE_PATH, CSV_CONSTANT_FILENAME)
+
+    atomic_write(constant_target, content)
+    atomic_write(target, content)
+    atomic_write(archive_target, content)
+    logging.info("Saved CSV: %s, %s, %s", constant_target, target, archive_target)
+
+    marker = os.path.join(ONE_DRIVE_PATH, f"download_failed_{datekey}.txt")
+    if os.path.exists(marker):
+        os.remove(marker)
+
+    return constant_target
+
+
+# =========================================================
+# --- Stats ---
+# =========================================================
+
+def compute_stats(csv_path: str) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+    df.columns = [c.strip() for c in df.columns]
+    missing = [c for c in CATEGORIES if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV is missing expected columns: {missing}")
+
+    # Force every fuel-type column to numeric. Some daily CAISO pulls contain a
+    # stray blank cell or non-numeric artifact, which makes pandas read the whole
+    # column as dtype=object — that then breaks matplotlib's isfinite() check with
+    # "ufunc 'isfinite' not supported for the input types...". Coercing here turns
+    # any bad values into NaN (which matplotlib/pandas handle fine) instead of crashing.
+    for c in CATEGORIES:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    bad_counts = df[CATEGORIES].isna().sum()
+    bad_counts = bad_counts[bad_counts > 0]
+    if len(bad_counts):
+        logging.warning("Non-numeric values coerced to NaN: %s", bad_counts.to_dict())
+        # forward/back-fill small gaps so start/end/avg stats aren't thrown off by a stray bad cell
+        df[CATEGORIES] = df[CATEGORIES].ffill().bfill()
+
+    start = df.iloc[0][CATEGORIES]
+    end = df.iloc[-1][CATEGORIES]
+    avg = df[CATEGORIES].mean()
+    net_mw = end - start
+    import numpy as np
+    start_denom = start.abs().astype(float)
+    start_denom = start_denom.where(start_denom != 0, np.nan)
+    net_pct = (end - start) / start_denom
+
+    stats = pd.DataFrame({
+        "start_mw": start,
+        "end_mw": end,
+        "avg_mw": avg,
+        "net_mw": net_mw,
+        "net_pct": net_pct,
+    })
+    # chart-safe (floor negatives at 0, only used for pie slices)
+    stats["start_chart"] = stats["start_mw"].clip(lower=0)
+    stats["end_chart"] = stats["end_mw"].clip(lower=0)
+    stats["avg_chart"] = stats["avg_mw"].clip(lower=0)
+    return df, stats
+
+
+# =========================================================
+# --- Rendering ---
+# =========================================================
+
+def pie_autopct(values):
+    total = sum(values)
+
+    def fmt(pct):
+        val = pct / 100.0 * total
+        if pct < 2.5:  # skip clutter on tiny slices
+            return ""
+        return f"{val:,.0f}\n{pct:.0f}%"
+    return fmt
+
+
+def draw_pie(ax, values, title):
+    colors = COLORS[:len(values)]
+    nonzero_mask = values > 0
+    wedges, _, autotexts = ax.pie(
+        values, colors=colors, autopct=pie_autopct(values),
+        pctdistance=0.72, startangle=90,
+        textprops={"fontsize": 7},
+        wedgeprops={"linewidth": 0.5, "edgecolor": "white"},
+    )
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    for t in autotexts:
+        t.set_fontsize(6.5)
+    # lock a consistent view window so label overflow never shrinks the pie itself
+    ax.set_xlim(-1.35, 1.35)
+    ax.set_ylim(-1.35, 1.35)
+    ax.set_aspect("equal")
+
+
+def draw_bar(ax, categories, values, title, ylabel, is_pct=False):
+    colors = ["#2E6F9E" if v >= 0 else "#B0413E" for v in values]
+    bars = ax.bar(categories, values, color=colors)
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.set_ylabel(ylabel, fontsize=7)
+    ax.axhline(0, color="black", linewidth=0.6)
+    ax.tick_params(axis="x", labelrotation=45, labelsize=6)
+    ax.tick_params(axis="y", labelsize=6)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    for b, v in zip(bars, values):
+        label = f"{v:.0%}" if is_pct else f"{v:,.0f}"
+        offset = (abs(max(values, key=abs)) * 0.03) if len(values) else 0
+        y = b.get_height() + (offset if v >= 0 else -offset)
+        va = "bottom" if v >= 0 else "top"
+        ax.text(b.get_x() + b.get_width() / 2, y, label, ha="center", va=va, fontsize=6)
+    if is_pct:
+        ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(xmax=1))
+
+
+def draw_line(ax, df):
+    time_idx = pd.to_datetime(df["Time"], format="%H:%M")
+    for cat, color in zip(CATEGORIES, COLORS):
+        ax.plot(time_idx, df[cat], label=cat, color=color, linewidth=1.1)
+    ax.set_title("Supply Trend Through the Day (5-min intervals)", fontsize=10, fontweight="bold")
+    ax.set_ylabel("MW", fontsize=7)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+    ax.tick_params(axis="x", labelrotation=0, labelsize=6)
+    ax.tick_params(axis="y", labelsize=6)
+    ax.axhline(0, color="black", linewidth=0.5)
+    ax.legend(fontsize=6, ncol=7, loc="upper center", bbox_to_anchor=(0.5, -0.13), frameon=False,
+              columnspacing=1.0, handlelength=1.4)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+
+
+def build_dashboard(df: pd.DataFrame, stats: pd.DataFrame, report_date: str, out_pdf: str, out_png: str = None):
+    fig = plt.figure(figsize=(8.5, 13), dpi=200)
+    gs = GridSpec(4, 2, figure=fig, height_ratios=[1, 1, 1, 1.05], hspace=0.45, wspace=0.25,
+                  top=0.91, bottom=0.09, left=0.07, right=0.95)
+
+    fig.suptitle("CAISO Daily Fuel Mix Dashboard", fontsize=15, fontweight="bold", x=0.07, y=0.985, ha="left")
+    fig.text(0.07, 0.955, f"Date: {report_date}   |   Source: CAISO fuelsource.csv (5-min intervals)",
+              fontsize=8.5, style="italic", color="#444444")
+
+    draw_pie(fig.add_subplot(gs[0, 0]), stats["start_chart"].values, "Fuel Mix at Start of Day (00:00)")
+    draw_pie(fig.add_subplot(gs[0, 1]), stats["end_chart"].values, "Fuel Mix at End of Day (23:55)")
+    draw_pie(fig.add_subplot(gs[1, 0]), stats["avg_chart"].values, "Fuel Mix — Daily Average")
+
+    ax_legend = fig.add_subplot(gs[1, 1])
+    ax_legend.axis("off")
+    handles = [plt.Rectangle((0, 0), 1, 1, color=c) for c in COLORS]
+    ax_legend.legend(handles, CATEGORIES, loc="center", fontsize=7.5, frameon=False, ncol=2, title="Fuel Types")
+
+    draw_bar(fig.add_subplot(gs[2, 0]), CATEGORIES, stats["net_mw"].values,
+              "Net Change, End vs Start (MW)", "MW")
+    net_pct_vals = stats["net_pct"].astype(float).fillna(0.0).values
+    draw_bar(fig.add_subplot(gs[2, 1]), CATEGORIES, net_pct_vals,
+              "Net Change, End vs Start (% of Morning Level)", "% of 00:00 level", is_pct=True)
+
+    ax_line = fig.add_subplot(gs[3, :])
+    draw_line(ax_line, df)
+
+    fig.text(0.07, 0.008, "Note: negative overnight MW (e.g. solar net-metering) is floored at 0 in the pie "
+                            "charts only; true signed values are used everywhere else.",
+              fontsize=6.5, style="italic", color="#666666")
+
+    fig.savefig(out_pdf, format="pdf")
+    if out_png:
+        fig.savefig(out_png, format="png", dpi=200)
+    plt.close(fig)
+
+
+# =========================================================
+# --- Main ---
+# =========================================================
+
+def main() -> int:
+    datekey = yesterday_datekey()
+    try:
+        csv_path = download_csv(datekey)
+    except Exception as e:
+        logging.exception("Download failed")
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        df, stats = compute_stats(csv_path)
+        report_date = datetime.strptime(datekey, "%Y%m%d").strftime("%m/%d/%Y")
+
+        pdf_constant = os.path.join(ONE_DRIVE_PATH, PDF_CONSTANT_FILENAME)
+        pdf_dated = os.path.join(ONE_DRIVE_PATH, PDF_DATED_TEMPLATE.format(datekey=datekey))
+        png_constant = os.path.join(ONE_DRIVE_PATH, PNG_CONSTANT_FILENAME)
+
+        build_dashboard(df, stats, report_date, pdf_constant, png_constant)
+        # keep a dated archive copy of the PDF too
+        import shutil
+        shutil.copyfile(pdf_constant, pdf_dated)
+
+        logging.info("Saved dashboard: %s, %s, %s", pdf_constant, pdf_dated, png_constant)
+        print(f"OK: dashboard saved to {pdf_constant}")
+        return 0
+    except Exception as e:
+        logging.exception("Dashboard build failed")
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
